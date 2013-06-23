@@ -77,99 +77,66 @@ bool QPspHandler::read(QImage *image)
         if (headerIdentifier != QByteArray::fromHex("7e424b00"))
             return false;
         input >> blockIdentifier;
-        if (blockIdentifier != pspImageBlock)
+        if (blockIdentifier != PSP_IMAGE_BLOCK)
             return false;
-        input >> totalBlockLength >> chunkSize;
-        quint32 tempLength;
-        if (majorVersion < 12)
-            tempLength = 0;
-        else
-            tempLength = 4;
+        /* PSP5SPEC: Initial data chunk length, 4 bytes */
+        if (majorVersion == 3) {
+            input >> chunkSize >> totalBlockLength;
+        } else {
+            input >> totalBlockLength >> chunkSize;
+        }
 
         if (totalBlockLength != chunkSize)
             return false;
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> imageWidth;
-            tempLength += 4;
+
+        input >> imageWidth;
+        input >> imageHeight;
+        input >> resolutionValue;
+        input >> resolutionMetric;
+        if (resolutionMetric > PSP_METRIC_CM)
+            return false;
+        input >> compressionType;
+        if (compressionType >= PSP_COMP_JPEG)
+            return false;
+        input >> bitDepth;
+        switch (bitDepth) { //must be 1, 4, 8, 24, or 48
+        case 1:
+        case 4:
+        case 8:
+        case 24:
+        case 48:
+            break;
+        default:
+            return false;
+            break;
         }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> imageHeight;
-            tempLength += 4;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> resolutionValue;
-            tempLength += 8;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> resolutionMetric;
-            if (resolutionMetric > pspMetricCm)
+        input >> planeCount;
+        if (planeCount != 1)
+            return false;
+        input >> colorCount;
+        if (colorCount != qPow(2, bitDepth))
+            return false;
+        input >> greyscaleFlag;
+        if (greyscaleFlag != 0)
+            if (greyscaleFlag != 1)
                 return false;
-            tempLength += 1;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> compressionType;
-            if (compressionType >= pspCompJpeg)
-                return false;
-            tempLength += 2;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> bitDepth;
-            switch (bitDepth) { //must be 1, 4, 8, 24, or 48
-            case 1:
-            case 4:
-            case 8:
-            case 24:
-            case 48:
-                break;
-            default:
-                return false;
-                break;
-            }
-            tempLength += 2;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> planeCount;
-            if (planeCount != 1)
-                return false;
-            tempLength += 2;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> colorCount;
-            if (colorCount != qPow(2, bitDepth))
-                return false;
-            tempLength += 4;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> greyscaleFlag;
-            if (greyscaleFlag != 0)
-                if (greyscaleFlag != 1)
-                    return false;
-            tempLength += 1;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> totalImageSize;
-            tempLength += 4;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> activeLayer;
-            tempLength += 4;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
-            input >> layerCount;
-            tempLength += 2;
-        }
-        if (tempLength < chunkSize) {//check if tempLength == chunksize
+        input >> totalImageSize;
+        input >> activeLayer;
+        input >> layerCount;
+
+        if (majorVersion != 3) {
             input >> graphicContents;
-            tempLength += 4;
-        }
-        /* Expansion field
-         * This field is currently non-existent, but robust readers should assume that
-         * data may be added here in the future, and silently ignore it.
-         */
-        while (tempLength < chunkSize) {
-            quint8 temp;
-            input >> temp;
-            tempLength += 1;
+            quint32 tempLength = 46;
+
+            /* Expansion field
+             * This field is currently non-existent, but robust readers should assume that
+             * data may be added here in the future, and silently ignore it.
+             */
+            while (tempLength < chunkSize) {
+                quint8 temp;
+                input >> temp;
+                tempLength += 1;
+            }
         }
 
         qDebug() << "chunk size:" << chunkSize << endl
@@ -184,136 +151,172 @@ bool QPspHandler::read(QImage *image)
                  << "greyscale flag:" << greyscaleFlag << endl
                  << "total image size:" << totalImageSize << endl
                  << "active layer:" << activeLayer << endl
-                 << "layer count:" << layerCount << endl
-                 << "graphic contents:" << graphicContents << endl;
+                 << "layer count:" << layerCount;
+        if (majorVersion != 3)
+                 qDebug() << "graphic contents:" << graphicContents;
+        qDebug() << endl;
     }
 
-    /* skip all optional blocks */
+    /* Look for PSP_COMPOSITE_IMAGE_BANK_BLOCK or PSP_LAYER_START_BLOCK */
     bool end = false;
     while (!end) {
         input.readRawData(headerIdentifier.data(), 4);
         if (headerIdentifier != QByteArray::fromHex("7e424b00")) {
-            qDebug() << "invalid header";
             return false;
         }
         input >> blockIdentifier;
-        if (blockIdentifier != pspCompositeImageBankBlock) {
-            //qDebug() << "block identifier" << blockIdentifier;
+        switch (blockIdentifier) {
+        case PSP_COMPOSITE_IMAGE_BANK_BLOCK: /* The Composite Image Bank Block */
+        {
+            quint32 compositeImageBankBlockLength, length, compositeImageCount;
+            input >> compositeImageBankBlockLength >> chunkSize;
+            length = chunkSize;
+            input >> compositeImageCount;
+
+            /* Composite Image Attributes Sub-Block */
+            quint32 compositeWidth, compositeHeight, compositeColorCount;
+            quint16 compositeBitDepth, compositeCompressionType, compositePlaneCount,
+                    compositeImageType;
+            for (quint32 i = 0; i < compositeImageCount; ++i) {
+                input.readRawData(headerIdentifier.data(), 4);
+                if (headerIdentifier != QByteArray::fromHex("7e424b00"))
+                    return false;
+                input >> blockIdentifier;
+                if (blockIdentifier != PSP_COMPOSITE_ATTRIBUTES_BLOCK)
+                    return false;
+                if (majorVersion == 3) {
+                    input >> totalBlockLength >> chunkSize;
+                    length += 14 + totalBlockLength;
+                } else  {
+                    input >> chunkSize >> totalBlockLength;
+                    length += 10 + totalBlockLength;
+                }
+                input >> compositeWidth;
+                input >> compositeHeight;
+                input >> compositeBitDepth;
+                switch (compositeBitDepth) { //must be 1, 4, 8, 24, or 48
+                case 1:
+                case 4:
+                case 8:
+                case 24:
+                case 48:
+                    break;
+                default:
+                    return false;
+                    break;
+                }
+                input >> compositeCompressionType;
+                if (compositeCompressionType > PSP_COMP_JPEG)
+                    return false;
+                input >> compositePlaneCount;
+                if (compositePlaneCount != 1)
+                    return false;
+                input >> compositeColorCount;
+                if (compositeColorCount != qPow(2, compositeBitDepth))
+                    return false;
+                input >> compositeImageType;
+                quint32 tempLength = 24;
+                /* Expansion field
+                 * This field is currently non-existent, but robust readers should assume that
+                 * data may be added here in the future, and silently ignore it.
+                 */
+                while (tempLength < chunkSize) {
+                    quint8 temp;
+                    input >> temp;
+                    tempLength += 1;
+                }
+                if (compositeImageType == PSP_IMAGE_COMPOSITE
+                        || (compositeImageCount == 1 && compositeImageType == PSP_IMAGE_THUMBNAIL)) {
+                    qDebug() << "composite width:" << compositeWidth << endl
+                             << "composite height:" << compositeHeight << endl
+                             << "composite bit depth:" << compositeBitDepth << endl
+                             << "composite compression type:" << compositeCompressionType << endl
+                             << "composite plane count:" << compositePlaneCount << endl
+                             << "composite color count:" << compositeColorCount << endl
+                             << "composite image type:" << compositeImageType << endl;
+                }
+            }
+
+            /* Composite Image Sub-Block */
+            for (quint32 i = 0; i < compositeImageCount; ++i) {
+                input.readRawData(headerIdentifier.data(), 4);
+                if (headerIdentifier != QByteArray::fromHex("7e424b00"))
+                    return false;
+                input >> blockIdentifier;
+                if (compositeCompressionType == PSP_COMP_JPEG) {
+                    if (blockIdentifier != PSP_JPEG_BLOCK)
+                        return false;
+                } else {
+                    if (blockIdentifier != PSP_COMPOSITE_IMAGE_BLOCK)
+                        return false;
+                }
+                input >> totalBlockLength;
+                length += 10 + totalBlockLength;
+                quint32 compressedImageSize, uncompressedImageSize;
+                quint16 imageType;
+                input >> chunkSize >> compressedImageSize >> uncompressedImageSize >> imageType;
+                compositeData.resize(compressedImageSize);
+                input.readRawData(compositeData.data(), compressedImageSize);
+                if (imageType == PSP_DIB_COMPOSITE ||
+                        (compositeImageCount == 1 && imageType == PSP_DIB_THUMBNAIL)) {
+                        qDebug() << "data size:" << compositeData.size() << endl
+                                 << "compressed image size:" << compressedImageSize << endl
+                                 << "uncompressed image size:" << uncompressedImageSize << endl
+                                 << "image type:" << imageType << endl;
+                        switch (compositeCompressionType) {
+                        case PSP_COMP_JPEG:
+                        {
+                            *image = QImage::fromData(compositeData);
+                            if (!image->isNull()) {
+                                return true;
+                            } else {
+                                qDebug() << "null";
+                                return false;
+                            }
+                        }
+                            break;
+                        default:
+                            qDebug() << "composite compression type" << compositeCompressionType << endl;
+                            break;
+                        }
+                    }
+            }
+
+            if (compositeImageBankBlockLength != length)
+                return false;
+        }
+            end = true;
+            break;
+        case PSP_LAYER_START_BLOCK: /* NOT YET IMPLEMENTED */
+            end = true;
+            break;
+        default:
+        {
+            if (majorVersion == 3) {
+                input >> chunkSize;
+            }
             input >> totalBlockLength;
             input.skipRawData(totalBlockLength);
-        } else {
+        }
+            break;
+        }
+        if (input.atEnd())
             end = true;
-        }
     }
-
-    quint32 compositeImageBankBlockLength, length, compositeImageCount;
-    input >> compositeImageBankBlockLength >> chunkSize;
-    length = chunkSize;
-    input >> compositeImageCount;
-
-    /* Composite Image Attributes Sub-Block */
-    quint32 compositeWidth, compositeHeight, compositeColorCount;
-    quint16 compositeBitDepth, compositeCompressionType, compositePlaneCount,
-            compositeImageType;
-    for (quint32 i = 0; i < compositeImageCount; ++i) {
-        input.readRawData(headerIdentifier.data(), 4);
-        if (headerIdentifier != QByteArray::fromHex("7e424b00"))
-            return false;
-        input >> blockIdentifier;
-        if (blockIdentifier != pspCompositeAttributesBlock)
-            return false;
-        input >> totalBlockLength;
-        length += 10 + totalBlockLength;
-        if (i != activeLayer)
-            input.skipRawData(totalBlockLength);
-        else {
-            input >> chunkSize;
-            if (totalBlockLength != chunkSize)
-                return false;
-            input >> compositeWidth >> compositeHeight;
-            input >> compositeBitDepth;
-            switch (compositeBitDepth) { //must be 1, 4, 8, 24, or 48
-            case 1:
-            case 4:
-            case 8:
-            case 24:
-            case 48:
-                break;
-            default:
-                return false;
-                break;
-            }
-            input >> compositeCompressionType;
-            if (compositeCompressionType > pspCompJpeg)
-                return false;
-            input >> compositePlaneCount;
-            if (compositePlaneCount != 1)
-                return false;
-            input >> compositeColorCount;
-            if (compositeColorCount != qPow(2, compositeBitDepth))
-                return false;
-            input >> compositeImageType;
-            qDebug() << "composite width:" << compositeWidth << endl
-                     << "composite height:" << compositeHeight << endl
-                     << "composite bit depth:" << compositeBitDepth << endl
-                     << "composite compression type:" << compositeCompressionType << endl;
-        }
-    }
-
-    /* Composite Image Sub-Block */
-    for (quint32 i = 0; i < compositeImageCount; ++i) {
-        input.readRawData(headerIdentifier.data(), 4);
-        if (headerIdentifier != QByteArray::fromHex("7e424b00"))
-            return false;
-        input >> blockIdentifier;
-        if (compositeCompressionType == pspCompJpeg) {
-            if (blockIdentifier != pspJpegBlock)
-                return false;
-        } else {
-            if (blockIdentifier != pspCompositeImageBlock)
-                return false;
-        }
-
-        input >> totalBlockLength;
-        length += 10 + totalBlockLength;
-        if (i != activeLayer)
-            input.skipRawData(totalBlockLength);
-        else {
-            quint32 compressedImageSize, uncompressedImageSize;
-            quint16 imageType;
-            input >> chunkSize >> compressedImageSize >> uncompressedImageSize >> imageType;
-            compositeData.resize(compressedImageSize);
-            input.readRawData(compositeData.data(), compressedImageSize);
-            qDebug() << "data size:" << compositeData.size() << endl
-                     << "compressed image size:" << compressedImageSize << endl
-                     << "uncompressed image size:" << uncompressedImageSize << endl
-                     << "image type:" << imageType << endl;
-            *image = QImage::fromData(compositeData);
-            if (!image->isNull()) {
-                return true;
-            } else {
-                qDebug() << "null";
-                return false;
-            }
-
-        }
-    }
-
-    if (compositeImageBankBlockLength != length)
-        return false;
 
     if (input.status() != QDataStream::Ok)
         return false;
     return true;
 }
 
-//not yet implemented
+/* NOT YET IMPLEMENTED */
 bool QPspHandler::supportsOption(ImageOption option) const
 {
     Q_UNUSED(option);
     return false;
 }
 
+/* NOT YET IMPLEMENTED */
 QVariant QPspHandler::option(ImageOption option) const
 {
     Q_UNUSED(option);
